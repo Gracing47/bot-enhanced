@@ -1,0 +1,1 @@
+# Bot-Enhanced Engine\n\nHigh-Performance Trading and Liquidation Engine for SparkDEX, Kinetic, and Enosys.\n\n## Tech Stack\n- Rust (High Performance)\n- Kinetic/Enosys/Morpho Integrations\n- Deterministic Soul Engine\n\n*Full observability and momentum-based strategy execution*
