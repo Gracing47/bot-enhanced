@@ -1,0 +1,179 @@
+use std::env;
+use std::sync::Arc;
+use std::time::Duration;
+
+use dotenvy::dotenv;
+use ethers::prelude::*;
+use eyre::Result;
+use tracing::{error, info, warn};
+
+// ── ABI Definitionen ──────────────────────────────────────────────────────────
+
+abigen!(
+    ITroveManager,
+    r#"[
+        function getTroveStatus(address _borrower) external view returns (uint256)
+        function getTroveStake(address _borrower) external view returns (uint256)
+        function getTroveDebt(address _borrower) external view returns (uint256)
+        function getTroveColl(address _borrower) external view returns (uint256)
+        function liquidate(address _borrower) external
+        function batchLiquidateTroves(address[] calldata _troveArray) external
+        function priceFeed() external view returns (address)
+    ]"#
+);
+
+abigen!(
+    IMultiTroveGetter,
+    r#"[
+        struct TroveData { address owner; uint256 debt; uint256 coll; uint256 stake; uint256 snapshotETH; uint256 snapshotLUSDDebt; }
+        function getMultipleSortedTroves(address _troveManager, int256 _startIdx, uint256 _count) external view returns (TroveData[] memory)
+        function getTroveCount(address _troveManager) external view returns (uint256)
+    ]"#
+);
+
+abigen!(
+    IPriceFeed,
+    r#"[
+        function fetchPrice() external returns (uint256)
+        function lastGoodPrice() external view returns (uint256)
+    ]"#
+);
+
+// ── Signer / Rotation ────────────────────────────────────────────────────────
+
+pub struct WalletRotator {
+    pub clients: Vec<Arc<SignerMiddleware<Arc<Provider<Http>>, LocalWallet>>>,
+    pub index:   usize,
+}
+
+impl WalletRotator {
+    pub fn new(pks_str: &str, provider: Arc<Provider<Http>>, chain_id: u64) -> Result<Self> {
+        let mut clients = Vec::new();
+        let keys: Vec<&str> = pks_str.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+        for key in keys {
+            let wallet = key.parse::<LocalWallet>()?.with_chain_id(chain_id);
+            let client = Arc::new(SignerMiddleware::new(provider.clone(), wallet));
+            clients.push(client);
+        }
+        if clients.is_empty() { return Err(eyre::eyre!("No valid keys")); }
+        Ok(Self { clients, index: 0 })
+    }
+
+    pub fn get_next(&mut self) -> Arc<SignerMiddleware<Arc<Provider<Http>>, LocalWallet>> {
+        let client = self.clients[self.index].clone();
+        self.index = (self.index + 1) % self.clients.len();
+        client
+    }
+}
+
+// ── ABI: FlashBotFlare ────────────────────────────────────────────────────────
+
+abigen!(
+    IFlashBotFlare,
+    r#"[
+        function callContract(address target, bytes payload, address tokenAddress) external payable
+    ]"#
+);
+
+// ── Config ──────────────────────────────────────────────────────────────────
+
+const FXRP_TROVE_MANAGER: &str = "0xc46e7d0538494FEb82b460b9723dAba0508C8Fb1";
+const WFLR_TROVE_MANAGER: &str = "0xB6cB0c5301D4E6e227Ba490cee7b92EB954ac06D";
+const MULTI_TROVE_GETTER: &str = "0xb80C59BBCEB205bCA25Eea2e4221717f23b339d3";
+const FLASHBOT_FLARE:     &str = "0xF61CaBDD39FD8EDBca98C4bb705b6B3678874a02";
+const WFLR_TOKEN:         &str = "0x1D80c49BbBCd1C0911346656B529DF9E5c2F783d";
+
+#[derive(Debug, Clone)]
+struct BranchConfig {
+    name:          &'static str,
+    trove_manager: Address,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    dotenv().ok();
+    tracing_subscriber::fmt::init();
+
+    info!("Initializing Enosys Multi-Branch Liquidator (TICKET-007 v2)...");
+
+    let rpc_url = env::var("RPC_URL").unwrap_or_else(|_| "http://127.0.0.1:9650".to_string());
+    let provider = Provider::<Http>::try_from(rpc_url)?;
+    let client = Arc::new(provider);
+
+    let pks = env::var("PRIVATE_KEYS").expect("PRIVATE_KEYS required");
+    let mut wallet_rotator = WalletRotator::new(&pks, client.clone(), 14u64)?;
+    
+    let fb_addr: Address = FLASHBOT_FLARE.parse()?;
+    
+    let getter_addr: Address = MULTI_TROVE_GETTER.parse()?;
+    let getter = IMultiTroveGetter::new(getter_addr, Arc::clone(&client));
+
+    let branches = vec![
+        BranchConfig {
+            name:          "FXRP Branch",
+            trove_manager: FXRP_TROVE_MANAGER.parse()?,
+        },
+        BranchConfig {
+            name:          "WFLR Branch",
+            trove_manager: WFLR_TROVE_MANAGER.parse()?,
+        },
+    ];
+
+    loop {
+        for branch in &branches {
+            match scan_branch(&getter, branch, &mut wallet_rotator, fb_addr).await {
+                Ok(_) => {},
+                Err(e) => error!("Error scanning {}: {}", branch.name, e),
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+    }
+}
+
+async fn scan_branch(
+    getter: &IMultiTroveGetter<Provider<Http>>, 
+    branch: &BranchConfig,
+    wallets: &mut WalletRotator,
+    fb_addr:  Address,
+) -> Result<()> {
+    let count = getter.get_trove_count(branch.trove_manager).call().await.unwrap_or(U256::zero());
+    if count == U256::zero() { return Ok(()); }
+
+    // Scan top 60 troves
+    let troves = getter.get_multiple_sorted_troves(branch.trove_manager, (-1).into(), 60.into()).call().await?;
+
+    for trove in troves {
+        if trove.1 == U256::zero() { continue; }
+
+        let itm = ITroveManager::new(branch.trove_manager, getter.client());
+        let feed_addr = itm.price_feed().call().await?;
+        let feed = IPriceFeed::new(feed_addr, getter.client());
+        let price = feed.last_good_price().call().await?;
+
+        // CR = (Collateral * Price) / Debt
+        let cr = (trove.2 * price) / trove.1;
+        let threshold = U256::from(1_100_000_000_000_000_000u64); // 110%
+
+        if cr < threshold {
+            warn!("!!! LIQUIDATABLE TROVE: {} | CR: {} | {}", trove.0, cr, branch.name);
+            
+            let client = wallets.get_next();
+            let flashbot = IFlashBotFlare::new(fb_addr, client.clone());
+
+            let itm_contract = ITroveManager::new(branch.trove_manager, client.clone());
+            let call = itm_contract.liquidate(trove.0);
+            let payload = call.calldata().ok_or_else(|| eyre::eyre!("failed to get calldata"))?;
+
+            info!("🚀 Strike owner {:?} via callContract (target={:?})...", trove.0, branch.trove_manager);
+            match flashbot.call_contract(branch.trove_manager, payload, WFLR_TOKEN.parse()?).send().await {
+                Ok(pending) => {
+                    info!("✅ Enosys TX: {:?}", pending.tx_hash());
+                    let _ = pending.await;
+                }
+                Err(e) => error!("❌ Enosys TX failed: {}", e),
+            }
+        }
+    }
+    Ok(())
+}
+

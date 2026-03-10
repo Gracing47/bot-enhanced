@@ -1,0 +1,42 @@
+[package]
+name    = "flare-bot"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "flare_bot"
+path = "src/lib.rs"
+
+# ── Binaries ──────────────────────────────────────────────────────────────────
+
+[[bin]]
+name = "kojo_flare"
+path = "src/bin/kojo_flare.rs"
+
+[[bin]]
+name = "kinetic_engine"
+path = "src/bin/kinetic_engine.rs"
+
+[[bin]]
+name = "bot3_momentum_v2"
+path = "src/bin/bot3_momentum_v2.rs"
+
+[[bin]]
+name = "kojo_trader"
+path = "src/bin/kojo_trader.rs"
+
+# ── Dependencies ──────────────────────────────────────────────────────────────
+
+[dependencies]
+ethers = { version = "2.0.14", features = ["abigen", "ws", "rustls"] }
+tokio = { version = "1.49.0", features = ["full"] }
+eyre = "0.6.12"
+futures = "0.3.32"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+dotenvy = "0.15.7"
+serde = { version = "1.0.211", features = ["derive"] }
+serde_json = "1.0.132"
+tokio-tungstenite = { version = "0.21.0", features = ["rustls-tls-native-roots"] }
+url = "2.5.8"
+reqwest = { version = "0.12.28", features = ["json", "rustls-tls"] }
